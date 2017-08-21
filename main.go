@@ -111,8 +111,7 @@ func (m *Mapper) InsertBatch(fields []string, rows []interface{}, onDuplicate in
 		return err
 	}
 	defer stmt.Close()
-	a, execErr := stmt.Exec(values...)
-	fmt.Println("A", a)
+	_, execErr := stmt.Exec(values...)
 	if execErr != nil {
 		fmt.Println("Exec: ", execErr)
 		return execErr
