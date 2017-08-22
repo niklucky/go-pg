@@ -1,22 +1,33 @@
 package pg
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
-	"time"
-	"strings"
-	"strconv"
 	"fmt"
-	"database/sql"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/lib/pq"
+	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
 const driverName = "postgres"
 
+/*
+LOG - logging type
+*/
 const LOG = "log"
+
+/*
+ERROR - logging type
+*/
 const ERROR = "error"
 
+/*
+DBConfig - Postgres config
+*/
 type DBConfig struct {
 	User,
 	Password,
@@ -26,6 +37,9 @@ type DBConfig struct {
 	SSLmode string
 }
 
+/*
+Mapper - Postgres Mapper to simplify interaction with DB
+*/
 type Mapper struct {
 	DBConfig          DBConfig
 	Conn              *sql.DB
@@ -34,12 +48,15 @@ type Mapper struct {
 	ConnectionInfo    string
 	ListenIdleTimeout time.Duration
 	Handler           func(interface{})
-	Logger func(...interface{}) error
+	Logger            func(...interface{}) error
 }
 
-func (mapper *Mapper) Connect() error {
-	dbConfig := mapper.DBConfig
-	mapper.ConnectionInfo = fmt.Sprintf("postgres://%v:%v@%v:%v/%v?sslmode=%v",
+/*
+connect - connecting to DB
+*/
+func (pgm *Mapper) connect() error {
+	dbConfig := pgm.DBConfig
+	pgm.ConnectionInfo = fmt.Sprintf("postgres://%v:%v@%v:%v/%v?sslmode=%v",
 		dbConfig.User,
 		dbConfig.Password,
 		dbConfig.Host,
@@ -47,21 +64,24 @@ func (mapper *Mapper) Connect() error {
 		dbConfig.Database,
 		dbConfig.SSLmode,
 	)
-	conn, err := sql.Open(driverName, mapper.ConnectionInfo)
+	conn, err := sql.Open(driverName, pgm.ConnectionInfo)
 	if err != nil {
 		fmt.Println("Connection error: ", err)
 		return err
 	}
 	if conn == nil {
-		return mapper.Log(ERROR, "Connection to PostgreSQL is nil", nil, nil)
+		return pgm.Log(ERROR, "Connection to PostgreSQL is nil", nil, nil)
 	}
-	mapper.Conn = conn
+	pgm.Conn = conn
 	return nil
 }
 
+/*
+Load - selecting data from DB
+*/
 func (pgm *Mapper) Load(source string, fields string, query interface{}) (*sql.Rows, error) {
-	if pgm.Conn == nil {
-		pgm.Connect()
+	if err := pgm.checkConnection(); err != nil {
+		return nil, err
 	}
 
 	SQL := "SELECT " + fields + " FROM " + source
@@ -70,22 +90,104 @@ func (pgm *Mapper) Load(source string, fields string, query interface{}) (*sql.R
 	}
 	SQL += ";"
 	// fmt.Println(SQL)
-	rows, err := pgm.Conn.Query(SQL)
+	rows, err := pgm.Exec(SQL)
 	if err != nil {
 		return rows, err
 	}
 	return rows, nil
 }
 
-func (m *Mapper) InsertBatch(fields []string, rows []interface{}, onDuplicate interface{}) error {
+/*
+Save — method inserts in DB row on duplicate key updates fields
+*/
+func (pgm *Mapper) Save(fields []string, values []interface{}, key map[string]interface{}) error {
+	SQL := pgm.generateInsertQuery(fields)
+	SQL += pgm.generateOnConflictQuery(fields, key)
+	return pgm.execute(SQL, values)
+}
+
+/*
+Create - creating new row in DB. Does not updates on conflict
+*/
+func (pgm *Mapper) Create(fields []string, values []interface{}) error {
+	SQL := pgm.generateInsertQuery(fields)
+	return pgm.execute(SQL, values)
+}
+
+func (pgm *Mapper) execute(SQL string, values []interface{}) error {
+	if err := pgm.checkConnection(); err != nil {
+		return err
+	}
+
+	stmt, err := pgm.Conn.Prepare(SQL)
+	if err != nil {
+		fmt.Println("Preparing statement error: ", err, SQL)
+		return err
+	}
+	defer stmt.Close()
+	_, execErr := stmt.Exec(values...)
+	if execErr != nil {
+		fmt.Println("Exec error: ", execErr)
+		return execErr
+	}
+	return nil
+}
+
+/*
+Exec - executing prepared SQL string
+*/
+func (pgm *Mapper) Exec(SQL string) (*sql.Rows, error) {
+	if err := pgm.checkConnection(); err != nil {
+		return nil, err
+	}
+	return pgm.Conn.Query(SQL)
+}
+
+func (pgm *Mapper) checkConnection() error {
+	if pgm.Conn == nil {
+		return pgm.connect()
+	}
+	return nil
+}
+func (pgm *Mapper) generateInsertQuery(fields []string) string {
+	SQL := "INSERT INTO " + pgm.Source + " (" + strings.Join(fields, ",") + ") VALUES "
+	var placeholder []string
+
+	for i := range fields {
+		key := strconv.Itoa((i + 1))
+		placeholder = append(placeholder, "$"+key)
+	}
+	SQL += "(" + strings.Join(placeholder, ",") + ")"
+	return SQL
+}
+func (pgm *Mapper) generateOnConflictQuery(fields []string, keys map[string]interface{}) string {
+	if len(keys) == 0 {
+		return " ON CONFLICT DO NOTHING "
+	}
+	var idx []string
+	for key := range keys {
+		idx = append(idx, key)
+	}
+	SQL := " ON CONFLICT (" + strings.Join(idx, ",") + ") DO UPDATE SET "
+	var placeholder []string
+	for i, field := range fields {
+		key := strconv.Itoa((i + 1))
+		value := field + " = $" + key + " "
+		placeholder = append(placeholder, value)
+	}
+	SQL += strings.Join(placeholder, ",")
+	return SQL
+}
+
+func (pgm *Mapper) InsertBatch(fields []string, rows []interface{}, onDuplicate interface{}) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	if m.Conn == nil {
-		m.Connect()
+	if err := pgm.checkConnection(); err != nil {
+		return err
 	}
 	var values = []interface{}{}
-	SQL := "insert into " + m.Source + " (" + strings.Join(fields, ",") + ") values "
+	SQL := "insert into " + pgm.Source + " (" + strings.Join(fields, ",") + ") values "
 
 	var placeholder []string
 
@@ -95,7 +197,7 @@ func (m *Mapper) InsertBatch(fields []string, rows []interface{}, onDuplicate in
 		var pl []string
 		for i := 0; i < len(r); i++ {
 			counter++
-			pl = append(pl, "$" + strconv.Itoa(counter))
+			pl = append(pl, "$"+strconv.Itoa(counter))
 			values = append(values, r[i])
 		}
 		placeholder = append(placeholder, "("+strings.Join(pl, ",")+")")
@@ -105,7 +207,7 @@ func (m *Mapper) InsertBatch(fields []string, rows []interface{}, onDuplicate in
 	if onDuplicate != nil {
 		SQL += " ON CONFLICT " + onDuplicate.(string)
 	}
-	stmt, err := m.Conn.Prepare(SQL)
+	stmt, err := pgm.Conn.Prepare(SQL)
 	if err != nil {
 		fmt.Println("stmt: ", SQL)
 		return err
@@ -118,40 +220,25 @@ func (m *Mapper) InsertBatch(fields []string, rows []interface{}, onDuplicate in
 	}
 	return nil
 }
-func (m *Mapper) Insert(fields []string, rows interface{}, onDuplicate interface{}) error {
-	var data []interface{}
-	data = append(data, rows)
-	return m.InsertBatch(fields, data, onDuplicate)
-}
 
-func (mapper *Mapper) Query(query string) (*sql.Rows, error) {
-	if mapper.Conn == nil {
-		err := mapper.Connect()
-		if err != nil {
-			return nil, err
-		}
+func (pgm *Mapper) Listen() error {
+	if err := pgm.checkConnection(); err != nil {
+		return err
 	}
-	return mapper.Conn.Query(query)
-}
-
-func (mapper *Mapper) Listen() error {
-	if mapper.Conn == nil {
-		mapper.Connect()
-	}
-	mapper.Log(LOG, "Listen " + mapper.DBConfig.Host + "/" + mapper.DBConfig.Database + " connecting")
+	pgm.Log(LOG, "Listen "+pgm.DBConfig.Host+"/"+pgm.DBConfig.Database+" connecting")
 	reportProblem := func(ev pq.ListenerEventType, err error) {
 		if err != nil {
-			mapper.Log("Error", "pg_listener_create_error", err, nil)
+			pgm.Log("Error", "pg_listener_create_error", err, nil)
 		}
 	}
 
-	mapper.Listener = pq.NewListener(mapper.ConnectionInfo, 10*time.Second, time.Minute, reportProblem)
-	err := mapper.Listener.Listen("finery")
+	pgm.Listener = pq.NewListener(pgm.ConnectionInfo, 10*time.Second, time.Minute, reportProblem)
+	err := pgm.Listener.Listen("finery")
 	if err != nil {
 		panic(err)
 	}
 	for {
-		mapper.HandleListen()
+		pgm.HandleListen()
 	}
 }
 
@@ -175,7 +262,7 @@ func (mapper *Mapper) HandleListen() {
 			return
 		case <-time.After(mapper.ListenIdleTimeout):
 			timeout := mapper.ListenIdleTimeout.String()
-			mapper.Log(LOG, mapper.GetDBInfo() + ": Received no events for " + timeout + ", checking connection")
+			mapper.Log(LOG, mapper.GetDBInfo()+": Received no events for "+timeout+", checking connection")
 			go func() {
 				l.Ping()
 			}()
@@ -194,7 +281,7 @@ func (m *Mapper) GetDBInfo() string {
 
 func (mapper *Mapper) Close() error {
 	if mapper.Conn != nil {
-		mapper.Log("log", mapper.GetDBInfo() + " closing connection")
+		mapper.Log("log", mapper.GetDBInfo()+" closing connection")
 		return mapper.Conn.Close()
 	}
 	return nil
